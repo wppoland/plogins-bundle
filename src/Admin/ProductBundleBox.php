@@ -24,11 +24,44 @@ final class ProductBundleBox implements HasHooks
     private const NONCE_ACTION = 'bundle_save_definition';
     private const NONCE_FIELD  = 'bundle_definition_nonce';
 
+    /**
+     * Hard cap on bundled items per product. Bounds the per-request work the
+     * storefront box and the one-click add-to-cart do (each item is a product
+     * load + a cart add), so a pasted list of thousands of IDs cannot turn a
+     * single product page or "add bundle" click into a denial-of-service.
+     */
+    private const MAX_ITEMS = 50;
+
     public function registerHooks(): void
     {
         add_action('woocommerce_product_data_panels', [$this, 'renderPanel']);
         add_filter('woocommerce_product_data_tabs', [$this, 'addTab']);
         add_action('woocommerce_process_product_meta', [$this, 'save']);
+        add_action('admin_enqueue_scripts', [$this, 'enqueueAssets']);
+    }
+
+    /**
+     * Load the shared admin stylesheet on the product editor so the bundle panel
+     * hint is styled. Scoped to the product edit screen only.
+     */
+    public function enqueueAssets(string $hook): void
+    {
+        if ($hook !== 'post.php' && $hook !== 'post-new.php') {
+            return;
+        }
+
+        $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+
+        if ($screen === null || $screen->post_type !== 'product') {
+            return;
+        }
+
+        wp_enqueue_style(
+            'bundle-admin',
+            BUNDLE_URL . 'assets/css/admin.css',
+            [],
+            \Bundle\VERSION,
+        );
     }
 
     /**
@@ -68,23 +101,36 @@ final class ProductBundleBox implements HasHooks
         ?>
         <div id="bundle_product_data" class="panel woocommerce_options_panel hidden">
             <?php wp_nonce_field(self::NONCE_ACTION, self::NONCE_FIELD); ?>
+            <p class="bundle-panel-hint">
+                <?php esc_html_e('Link the products that are usually bought together with this one. They appear in a "frequently bought together" box on this product\'s page, and shoppers can add the whole set to the cart in one click.', 'bundle'); ?>
+                <br />
+                <?php
+                printf(
+                    /* translators: %s: "Products > All Products" admin breadcrumb. */
+                    esc_html__('Tip: the product ID is shown in the URL when you edit a product, and in the ID column under %s.', 'bundle'),
+                    '<strong>' . esc_html__('Products', 'bundle') . '</strong>'
+                );
+                ?>
+            </p>
             <div class="options_group">
-                <p class="form-field">
+                <p class="form-field bundle-field">
                     <label for="bundle_items"><?php esc_html_e('Bundled product IDs', 'bundle'); ?></label>
                     <input
                         type="text"
                         id="bundle_items"
                         name="bundle_items"
-                        class="short"
-                        style="width:50%;"
+                        class="long"
                         value="<?php echo esc_attr($items); ?>"
-                        placeholder="e.g. 42, 108, 256"
+                        placeholder="<?php esc_attr_e('e.g. 42, 108, 256', 'bundle'); ?>"
+                        inputmode="numeric"
+                        autocomplete="off"
+                        aria-describedby="bundle_items_desc"
                     />
-                    <span class="description">
-                        <?php esc_html_e('Comma-separated product IDs to sell alongside this product.', 'bundle'); ?>
+                    <span class="description" id="bundle_items_desc">
+                        <?php esc_html_e('Comma-separated product IDs to sell alongside this product. Duplicates, blanks and this product\'s own ID are ignored automatically.', 'bundle'); ?>
                     </span>
                 </p>
-                <p class="form-field">
+                <p class="form-field bundle-field">
                     <label for="bundle_discount_percent"><?php esc_html_e('Bundle discount (%)', 'bundle'); ?></label>
                     <input
                         type="number"
@@ -95,9 +141,10 @@ final class ProductBundleBox implements HasHooks
                         max="100"
                         step="0.01"
                         value="<?php echo esc_attr($percent); ?>"
+                        aria-describedby="bundle_discount_desc"
                     />
-                    <span class="description">
-                        <?php esc_html_e('Optional discount applied when the whole bundle is added to the cart.', 'bundle'); ?>
+                    <span class="description" id="bundle_discount_desc">
+                        <?php esc_html_e('Optional. The percentage off the combined price when the whole bundle is added to the cart. Leave at 0 for no discount (the box still cross-sells the items). Values are clamped to 0–100.', 'bundle'); ?>
                     </span>
                 </p>
             </div>
@@ -136,6 +183,10 @@ final class ProductBundleBox implements HasHooks
 
             if ($itemId > 0 && $itemId !== $postId && ! in_array($itemId, $items, true)) {
                 $items[] = $itemId;
+            }
+
+            if (count($items) >= self::MAX_ITEMS) {
+                break;
             }
         }
 
